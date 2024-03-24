@@ -11,9 +11,8 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from chunkllama_attn_replace import replace_with_chunkllama
-from utils import DSPipeline
-import deepspeed
 
+print(os.getenv('CUDA_VISIBLE_DEVICES'))
 
 def generate_prompt_landmark(n_garbage, seed):
     """Generates a text file and inserts an passkey at a random position."""
@@ -42,27 +41,21 @@ def generate_prompt_landmark(n_garbage, seed):
     return "\n".join(lines), str(pass_key)
 
 
-def passkey_retrieval_test(args, model, tokenizer, use_cache=False, n_garbage=60000, seed=666):
+def passkey_retrieval_test(model, tokenizer, use_cache=False, n_garbage=60000, seed=666):
     prompt, answer = generate_prompt_landmark(n_garbage, seed)
-    if "Swallow" in args.model:
-        torch.cuda.empty_cache()
-        model_answer = model(prompt, num_tokens=args.max_tokens)
-        is_correct = (model_answer == answer)
-        print("answer", model_answer)
-    else:
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        input_ids = input_ids.to(model.device)
-        len_token = input_ids.shape[-1]
-        print("len tokens", len_token // 1000, "k")
-        answer_ids = tokenizer(answer, return_tensors="pt").input_ids[:, 1:]  # drop BOS
-        torch.cuda.empty_cache()
-        generation_output = model.generate(
-            input_ids=input_ids, max_new_tokens=answer_ids.shape[-1], num_beams=1, use_cache=use_cache
-        )
-        torch.cuda.empty_cache()
-        model_answer = generation_output[0, -answer_ids.shape[-1]:].cpu()
-        is_correct = (model_answer == answer_ids[0]).all().item()
-        print("answer", tokenizer.decode(generation_output[0][len_token:]))
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    input_ids = input_ids.to(model.device)
+    len_token = input_ids.shape[-1]
+    print("len tokens", len_token // 1000, "k")
+    answer_ids = tokenizer(answer, return_tensors="pt").input_ids[:, 1:]  # drop BOS
+    torch.cuda.empty_cache()
+    generation_output = model.generate(
+        input_ids=input_ids, max_new_tokens=answer_ids.shape[-1], num_beams=1, use_cache=use_cache
+    )
+    torch.cuda.empty_cache()
+    model_answer = generation_output[0, -answer_ids.shape[-1]:].cpu()
+    is_correct = (model_answer == answer_ids[0]).all().item()
+    print("answer", tokenizer.decode(generation_output[0][len_token:]))
     print(answer)
     if is_correct:
         print("success")
@@ -73,22 +66,16 @@ def passkey_retrieval_test(args, model, tokenizer, use_cache=False, n_garbage=60
 
 
 def main(args):
-    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     if "Swallow" in args.model:
-        model = DSPipeline(
-                    model_name=args.model,
-                    dtype=args.dtype,
-                    is_meta=args.is_meta,
-                    device=args.local_rank,
-                    checkpoint_path=None,
-                    trust_remote_code=args.trust_remote_code)
-        model.model = deepspeed.init_inference(
-                        model.model,
-                        dtype=args.dtype,
-                        mp_size=args.world_size,
-                        max_tokens=args.max_tokens,
-                        )
+        model = AutoModelForCausalLM.from_pretrained(
+                    args.model,
+                    torch_dtype=eval(args.dtype),
+                    trust_remote_code=args.trust_remote_code,
+                    device_map='auto',
+                    attn_implementation="flash_attention_2",
+                    )
 
     elif "70b" != args.scale:
         from accelerate import init_empty_weights, load_checkpoint_and_dispatch
@@ -115,7 +102,7 @@ def main(args):
     total_tokens = 0
     for j in range(args.num_tests):
         torch.cuda.empty_cache()
-        is_correct, len_tokens = passkey_retrieval_test(args, model, tokenizer, n_garbage=n_garbage, seed=j)
+        is_correct, len_tokens = passkey_retrieval_test(model, tokenizer, n_garbage=n_garbage, seed=j)
         passed_tests += is_correct
         total_tokens += len_tokens
     avg_tokens = total_tokens // args.num_tests
@@ -140,12 +127,8 @@ if __name__ == "__main__":
     parser.add_argument("--local_window", type=int, default=256, help='set to 64 for Llama 7B will lead to better results')
     parser.add_argument('--pretraining_length', type=int, default=4096)
     parser.add_argument("--model", required=True, type=str, help="model_name")
-    parser.add_argument("--dtype", default="float16", type=str, choices=["float32", "float16", "int8", "bfloat16"], help="data-type")
-    parser.add_argument("--max_tokens", default=1024, type=int, help="maximum tokens used for the text-generation KV-cache")
-    parser.add_argument("--is_meta", action='store_true', help="use the meta tensors to initialize model")
-    parser.add_argument("--local_rank", type=int, default=int(os.getenv("LOCAL_RANK", "0")), help="local rank")
-    parser.add_argument("--world_size", type=int, default=int(os.getenv("WORLD_SIZE", "1")), help="world_size")
+    parser.add_argument("--dtype", default="float16", type=str, help="data-type")
     parser.add_argument("--trust_remote_code", action='store_true', help="Trust remote code for hugging face models")
     args = parser.parse_args()
-    replace_with_chunkllama(args.pretraining_length)
+    #replace_with_chunkllama(args.pretraining_length)
     main(args)
